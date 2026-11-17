@@ -1,19 +1,54 @@
 #!/usr/bin/env node
 
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
+import { randomUUID } from "node:crypto";
+import {
+  createServer as createNodeServer,
+  type IncomingMessage,
+  type ServerResponse,
+} from "node:http";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Worker } from "node:worker_threads";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const OLLAMA_API_BASE = "https://ollama.com/api";
-const REQUEST_TIMEOUT_MS = 30_000;
-const MAX_FETCH_CONTENT_LENGTH = 50_000;
+const DEFAULT_HTTP_PORT = 33011;
+const DEFAULT_IDLE_MS = 60_000;
+const WORKER_REQUEST_TIMEOUT_MS = 60_000;
+const MAX_BODY_BYTES = 4 * 1024 * 1024;
+const MCP_PATH = "/mcp";
+const HTTP_BIND_HOST = "127.0.0.1";
+const ALLOWED_HOSTNAMES = new Set(["127.0.0.1", "localhost"]);
+
+const HTTP_PORT = Number(process.env.MCP_PORT) || DEFAULT_HTTP_PORT;
+const IDLE_MS = Number(process.env.MCP_IDLE_MS) || DEFAULT_IDLE_MS;
+
+// Derived at runtime on purpose: a literal specifier here would let esbuild
+// inline the whole MCP stack into this cold-wrapper bundle.
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SERVER_MODULE_PATH = path.join(MODULE_DIR, "server.js");
+
+// Bridge shapes mirror the real module. Duplicated on purpose: a type import
+// would make the wrapper's module graph reach the real code.
+type BridgeRequest = {
+  id: string;
+  method: string;
+  url: string;
+  headers: Record<string, string | string[] | undefined>;
+  bodyText: string;
+};
+
+type BridgeResponse = {
+  id: string;
+  status: number;
+  headers: Record<string, string>;
+  bodyText: string;
+};
 
 // ---------------------------------------------------------------------------
-// API key validation (fail fast)
+// API key validation (fail fast, both modes)
 // ---------------------------------------------------------------------------
 
 const apiKey = process.env.OLLAMA_API_KEY;
@@ -23,212 +58,352 @@ if (!apiKey) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared HTTP helper
+// HTTP response helpers
 // ---------------------------------------------------------------------------
 
-async function ollamaFetch(
-  endpoint: string,
-  body: Record<string, unknown>
-): Promise<unknown> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
 
+function readBody(req: IncomingMessage): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+
+    req.on("data", (chunk: Buffer) => {
+      if (settled) {
+        return;
+      }
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        settled = true;
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on("end", () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    req.on("error", (error: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(error);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Request guards
+// ---------------------------------------------------------------------------
+
+function isAllowedHost(hostHeader: string | undefined, port: number): boolean {
+  if (!hostHeader) {
+    return false;
+  }
+  const [hostname, rawPort] = hostHeader.trim().toLowerCase().split(":");
+  if (!ALLOWED_HOSTNAMES.has(hostname)) {
+    return false;
+  }
+  return rawPort === undefined || rawPort === "" || rawPort === String(port);
+}
+
+function isAllowedOrigin(origin: string): boolean {
   try {
-    const response = await fetch(`${OLLAMA_API_BASE}${endpoint}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+    return ALLOWED_HOSTNAMES.has(new URL(origin).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Worker pool (exactly zero or one worker)
+// ---------------------------------------------------------------------------
+
+type Pending = {
+  resolve: (response: BridgeResponse) => void;
+  reject: (error: Error) => void;
+};
+
+let worker: Worker | null = null;
+let terminating: Promise<void> | null = null;
+let idleTimer: NodeJS.Timeout | null = null;
+const pending = new Map<string, Pending>();
+
+function rssMb(): number {
+  return Math.round(process.memoryUsage().rss / 1024 / 1024);
+}
+
+function failPending(error: Error): void {
+  const entries = Array.from(pending.values());
+  pending.clear();
+  for (const entry of entries) {
+    entry.reject(error);
+  }
+}
+
+function terminateWorker(target: Worker): Promise<void> {
+  const done = target.terminate().then(
+    () => undefined,
+    () => undefined
+  );
+  terminating = done;
+  void done.then(() => {
+    if (terminating === done) {
+      terminating = null;
+    }
+  });
+  return done;
+}
+
+async function getWorker(): Promise<Worker> {
+  if (terminating) {
+    await terminating;
+  }
+  if (worker) {
+    return worker;
+  }
+
+  const spawned = new Worker(SERVER_MODULE_PATH);
+
+  spawned.on("message", (message: BridgeResponse) => {
+    const entry = pending.get(message.id);
+    if (!entry) {
+      return;
+    }
+    pending.delete(message.id);
+    entry.resolve(message);
+  });
+
+  spawned.on("error", (error: Error) => {
+    if (worker !== spawned) {
+      return;
+    }
+    worker = null;
+    console.error("worker error:", error.message);
+    failPending(new Error("worker error"));
+  });
+
+  spawned.on("exit", (code: number) => {
+    if (worker !== spawned) {
+      return;
+    }
+    worker = null;
+    console.error(`worker exited unexpectedly (code ${code})`);
+    failPending(new Error("worker exited"));
+  });
+
+  worker = spawned;
+  console.error(`real code warm (rss=${rssMb()}MB)`);
+  return spawned;
+}
+
+function scheduleIdleEviction(): void {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+  }
+  idleTimer = setTimeout(() => {
+    idleTimer = null;
+    void evictIdleWorker();
+  }, IDLE_MS);
+  idleTimer.unref();
+}
+
+async function evictIdleWorker(): Promise<void> {
+  const current = worker;
+  if (!current) {
+    return;
+  }
+  if (pending.size > 0) {
+    scheduleIdleEviction();
+    return;
+  }
+
+  worker = null;
+  const before = rssMb();
+  await terminateWorker(current);
+
+  const gc = (globalThis as { gc?: () => void }).gc;
+  if (typeof gc === "function") {
+    gc();
+  }
+  const after = rssMb();
+  console.error(
+    `evicted after idle (rss ${before}→${after} MB, gc: ${typeof gc === "function" ? "invoked" : "unavailable"})`
+  );
+}
+
+async function dropWorker(): Promise<void> {
+  const current = worker;
+  if (!current) {
+    return;
+  }
+  worker = null;
+  await terminateWorker(current);
+}
+
+async function forwardToWorker(
+  request: BridgeRequest
+): Promise<BridgeResponse> {
+  const target = await getWorker();
+  return new Promise<BridgeResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(request.id);
+      reject(new Error("timeout"));
+    }, WORKER_REQUEST_TIMEOUT_MS);
+
+    pending.set(request.id, {
+      resolve: (response) => {
+        clearTimeout(timer);
+        resolve(response);
       },
-      body: JSON.stringify(body),
-      signal: controller.signal,
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
     });
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      if (response.status === 401) {
-        throw new Error("Unauthorized: OLLAMA_API_KEY is invalid or expired");
-      }
-      if (response.status === 429) {
-        throw new Error("Rate limited: too many requests to Ollama API");
-      }
-      throw new Error(
-        `Ollama API error: HTTP ${response.status} ${response.statusText}${text ? ` — ${text.slice(0, 200)}` : ""}`
-      );
-    }
-
-    let data: unknown;
-    try {
-      data = await response.json();
-    } catch {
-      throw new Error(
-        "Ollama API returned a non-JSON response. The API may be experiencing issues."
-      );
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(
-        `Request to Ollama API timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-      );
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Response shape validation
-// ---------------------------------------------------------------------------
-
-const WebSearchResultSchema = z.object({
-  title: z.string(),
-  url: z.string(),
-  content: z.string(),
-});
-
-const WebSearchResponseSchema = z.object({
-  results: z.array(WebSearchResultSchema),
-});
-
-const WebFetchResponseSchema = z.object({
-  title: z.string(),
-  content: z.string(),
-  links: z.array(z.string()),
-});
-
-// ---------------------------------------------------------------------------
-// Implementation functions (separated from MCP registration)
-// ---------------------------------------------------------------------------
-
-type WebSearchResponse = z.infer<typeof WebSearchResponseSchema>;
-type WebFetchResponse = z.infer<typeof WebFetchResponseSchema>;
-
-async function webSearchImpl(
-  query: string,
-  maxResults: number = 3
-): Promise<WebSearchResponse> {
-  const raw = await ollamaFetch("/web_search", {
-    query,
-    max_results: maxResults,
+    target.postMessage(request);
   });
-  const parsed = WebSearchResponseSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new Error(
-      `Unexpected response shape from Ollama web_search API: ${parsed.error.message}`
-    );
-  }
-  return parsed.data;
-}
-
-async function webFetchImpl(url: string): Promise<WebFetchResponse> {
-  const raw = await ollamaFetch("/web_fetch", { url });
-  const parsed = WebFetchResponseSchema.safeParse(raw);
-  if (!parsed.success) {
-    throw new Error(
-      `Unexpected response shape from Ollama web_fetch API: ${parsed.error.message}`
-    );
-  }
-  const data = parsed.data;
-  if (data.content && data.content.length > MAX_FETCH_CONTENT_LENGTH) {
-    data.content =
-      data.content.slice(0, MAX_FETCH_CONTENT_LENGTH) +
-      `\n\n[Content truncated at ${MAX_FETCH_CONTENT_LENGTH} characters. Original length: ${data.content.length} characters]`;
-  }
-  return data;
 }
 
 // ---------------------------------------------------------------------------
-// MCP server & tool registration
+// HTTP handling (cold wrapper)
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({
-  name: "ollama-web-search",
-  version: "1.0.0",
-});
-
-server.registerTool(
-  "web_search",
-  {
-    description:
-      "Search the web using Ollama's hosted search API. Returns a list of results with title, URL, and content snippet for each match.",
-    inputSchema: z.object({
-      query: z.string().describe("The search query string"),
-      max_results: z
-        .number()
-        .min(1)
-        .max(10)
-        .default(3)
-        .describe(
-          "Maximum number of results to return (default: 3, max: 10)"
-        ),
-    }),
-    annotations: {
-      readOnlyHint: true,
-    },
-  },
-  async ({ query, max_results }) => {
-    try {
-      const result = await webSearchImpl(query, max_results);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-        isError: true,
-      };
-    }
+async function handleHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse
+): Promise<void> {
+  if (!isAllowedHost(req.headers.host, HTTP_PORT)) {
+    sendJson(res, 403, { error: "forbidden host" });
+    return;
   }
-);
 
-server.registerTool(
-  "web_fetch",
-  {
-    description:
-      "Fetch the content of a web page by URL using Ollama's hosted fetch API. Returns the page title, main content (truncated if very long), and links found on the page.",
-    inputSchema: z.object({
-      url: z
-        .string()
-        .url()
-        .describe("The absolute URL to fetch (e.g. https://example.com)"),
-    }),
-    annotations: {
-      readOnlyHint: true,
-      openWorldHint: true,
-    },
-  },
-  async ({ url }) => {
-    try {
-      const result = await webFetchImpl(url);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-      };
-    } catch (error) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Error: ${error instanceof Error ? error.message : String(error)}`,
-          },
-        ],
-        isError: true,
-      };
-    }
+  const origin = req.headers.origin;
+  if (origin !== undefined && !isAllowedOrigin(origin)) {
+    sendJson(res, 403, { error: "forbidden origin" });
+    return;
   }
-);
+
+  const pathname = new URL(
+    req.url ?? "/",
+    `http://${HTTP_BIND_HOST}:${HTTP_PORT}`
+  ).pathname;
+
+  if (pathname !== MCP_PATH) {
+    sendJson(res, 404, { error: "not found" });
+    return;
+  }
+
+  const method = req.method ?? "GET";
+  if (method !== "POST") {
+    sendJson(res, 405, { error: "method not allowed" });
+    return;
+  }
+
+  const bodyText = await readBody(req);
+  if (bodyText === null) {
+    sendJson(res, 413, { error: "payload too large" });
+    return;
+  }
+
+  const request: BridgeRequest = {
+    id: randomUUID(),
+    method,
+    url: `http://${HTTP_BIND_HOST}:${HTTP_PORT}${req.url ?? MCP_PATH}`,
+    headers: req.headers,
+    bodyText,
+  };
+
+  scheduleIdleEviction();
+
+  try {
+    const response = await forwardToWorker(request);
+    res.writeHead(response.status, response.headers);
+    res.end(response.bodyText);
+  } catch (error) {
+    if (error instanceof Error && error.message === "timeout") {
+      await dropWorker();
+      sendJson(res, 500, { error: "timeout" });
+      return;
+    }
+    sendJson(res, 500, { error: "internal" });
+  } finally {
+    scheduleIdleEviction();
+  }
+}
+
+async function startHttpWrapper(): Promise<void> {
+  const httpServer = createNodeServer((req, res) => {
+    handleHttpRequest(req, res).catch((error) => {
+      console.error("HTTP request error:", error);
+      if (res.headersSent) {
+        res.end();
+      } else {
+        sendJson(res, 500, { error: "internal" });
+      }
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(HTTP_PORT, HTTP_BIND_HOST, () => {
+      httpServer.off("error", reject);
+      resolve();
+    });
+  });
+
+  console.error(
+    `wrapper up on http://${HTTP_BIND_HOST}:${HTTP_PORT}${MCP_PATH} (cold, idle-evict ${IDLE_MS}ms)`
+  );
+
+  const shutdown = () => {
+    console.error("Shutting down...");
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+    const current = worker;
+    worker = null;
+    httpServer.close();
+    const finish = () => process.exit(0);
+    if (current) {
+      void terminateWorker(current).then(finish, finish);
+    } else {
+      finish();
+    }
+  };
+
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
 
 // ---------------------------------------------------------------------------
-// Server startup & graceful shutdown
+// stdio mode (real code loaded on demand)
 // ---------------------------------------------------------------------------
 
-async function main() {
+async function startStdio(): Promise<void> {
+  const { createServer } = await import(
+    pathToFileURL(SERVER_MODULE_PATH).href
+  );
+  const { StdioServerTransport } = await import(
+    "@modelcontextprotocol/sdk/server/stdio.js"
+  );
+
+  const server = createServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("ollama-web-search MCP server running on stdio");
@@ -242,7 +417,13 @@ async function main() {
   process.on("SIGINT", shutdown);
 }
 
-main().catch((error) => {
+// ---------------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------------
+
+const start = process.argv[2] === "--http" ? startHttpWrapper : startStdio;
+
+start().catch((error) => {
   console.error("Fatal error starting MCP server:", error);
   process.exit(1);
 });

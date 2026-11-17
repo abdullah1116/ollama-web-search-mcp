@@ -1,0 +1,13 @@
+[Unit]
+Description=Ollama Web Search MCP server (HTTP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={{NODE_BIN}} --expose-gc {{SERVER_PATH}} --http
+EnvironmentFile={{ENV_FILE}}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
