@@ -1,22 +1,39 @@
-# Ollama Web Search MCP Server
+# ollama-web-search-mcp
 
-Expose Ollama's web search and web fetch APIs as MCP tools for AI assistants.
+MCP server exposing Ollama's `web_search` and `web_fetch` APIs as tools for AI assistants. One binary, two modes: **stdio** (default, spawned per client) or **HTTP** on loopback for clients that connect by URL — with a systemd user-service installer.
 
-## Prerequisites
-
-- Node.js 18 or later
-- An Ollama API key (get one at https://ollama.com/settings/keys)
-
-## Quick start
+## Install
 
 ```bash
-git clone <repo> && cd ollama-web-search-mcp
-npm install
-npm run build
-OLLAMA_API_KEY=your_key node build/index.js
+npm install -g ollama-web-search-mcp
 ```
 
-## Client configuration
+From source (Node.js 18+):
+
+```bash
+git clone https://github.com/abdullah1116/ollama-web-search-mcp.git
+cd ollama-web-search-mcp
+npm install && npm run build
+```
+
+An [Ollama API key](https://ollama.com/settings/keys) is required — the server exits at startup without `OLLAMA_API_KEY`.
+
+## Tools
+
+| Tool | Parameters | Description |
+|------|-----------|-------------|
+| `web_search` | `query` (string, required) · `max_results` (number, default 3, max 10) | Search the web; returns title, URL, content snippet |
+| `web_fetch` | `url` (string, required) | Fetch a page; returns title, content (truncated at 50k chars), links |
+
+## Environment variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `OLLAMA_API_KEY` | yes | — | Ollama API key |
+| `MCP_PORT` | no | `33011` | HTTP mode: listen port (loopback only) |
+| `MCP_IDLE_MS` | no | `60000` | HTTP mode: idle ms before the loaded code is evicted and memory returns to the cold floor |
+
+## stdio mode
 
 ### Claude Desktop / Cline
 
@@ -26,18 +43,19 @@ OLLAMA_API_KEY=your_key node build/index.js
 {
   "mcpServers": {
     "ollama-web-search": {
-      "command": "node",
-      "args": ["/absolute/path/to/ollama-web-search-mcp/build/index.js"],
+      "command": "ollama-web-search-mcp",
       "env": { "OLLAMA_API_KEY": "your_api_key_here" }
     }
   }
 }
 ```
 
+Running from source instead of a global install: `"command": "node", "args": ["/absolute/path/to/ollama-web-search-mcp/build/index.js"]`.
+
 ### Claude Code (CLI)
 
 ```bash
-claude mcp add ollama-web-search -e OLLAMA_API_KEY=your_key -- node /absolute/path/to/ollama-web-search-mcp/build/index.js
+claude mcp add ollama-web-search -e OLLAMA_API_KEY=your_key -- ollama-web-search-mcp
 ```
 
 ### OpenAI Codex
@@ -46,78 +64,44 @@ claude mcp add ollama-web-search -e OLLAMA_API_KEY=your_key -- node /absolute/pa
 
 ```toml
 [mcp_servers.ollama-web-search]
-command = "node"
-args = ["/absolute/path/to/ollama-web-search-mcp/build/index.js"]
+command = "ollama-web-search-mcp"
 env = { OLLAMA_API_KEY = "your_api_key_here" }
 ```
 
 ### Goose
 
-In the MCP server configuration UI:
+Command `ollama-web-search-mcp`, environment `OLLAMA_API_KEY=your_api_key_here`.
 
-- **Command:** `node`
-- **Args:** `/absolute/path/to/ollama-web-search-mcp/build/index.js`
-- **Environment:** `OLLAMA_API_KEY=your_api_key_here`
+## HTTP mode — systemd user service
 
-## Tools
-
-| Tool | Parameters | Description |
-|------|-----------|-------------|
-| `web_search` | `query` (string, required), `max_results` (number, optional, default 3, max 10) | Search the web and return results with title, URL, and content snippet |
-| `web_fetch` | `url` (string, required, must be valid URL) | Fetch a web page by URL and return its title, content, and links |
-
-## Environment variables
-
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `OLLAMA_API_KEY` | Yes | Your Ollama API key for authentication |
-
-## Python version
-
-A Python implementation (`web-search-mcp.py`) is also included. Run it with `uv run web-search-mcp.py`.
-
-## Run as a systemd user service (background)
-
-Runs the server in HTTP mode on loopback, so local MCP clients can connect over a URL instead of spawning their own process.
+An always-on wrapper on `http://127.0.0.1:33011/mcp` (loopback only): the MCP stack is lazy-loaded per request and evicted after `MCP_IDLE_MS` idle, so memory returns to the cold floor.
 
 ```bash
 npm run build
 ./scripts/install-service.sh
 ```
 
-The installer writes `~/.config/systemd/user/ollama-web-search-mcp.service` and creates `~/.config/ollama-web-search-mcp/env` (mode 600) if it does not exist. Put your key in the env file:
+The installer writes `~/.config/systemd/user/ollama-web-search-mcp.service` and creates `~/.config/ollama-web-search-mcp/env` (mode 600) if missing. Put your key there:
 
 ```bash
 # ~/.config/ollama-web-search-mcp/env
 OLLAMA_API_KEY=your_key
 ```
 
-Then restart the service:
+Restart and watch logs:
 
 ```bash
 systemctl --user restart ollama-web-search-mcp
-```
-
-Status and logs:
-
-```bash
-systemctl --user status ollama-web-search-mcp
 journalctl --user -u ollama-web-search-mcp -f
 ```
 
-The server listens on `http://127.0.0.1:33011/mcp` and binds to loopback only — it is not reachable from other machines. To change the port, add `MCP_PORT=8080` to the env file and restart the service.
-
-The service is a lightweight always-on wrapper: the MCP stack is lazy-loaded per request and evicted after `MCP_IDLE_MS` (default 60000) idle, so its memory footprint returns to the cold floor.
-
-Uninstall (the env file is kept):
+Change the port with `MCP_PORT=8080` in the env file. Uninstall (env file kept):
 
 ```bash
 ./scripts/install-service.sh --uninstall
 ```
 
-## Connect agentic tools via URL
-
-Clients that support HTTP transport can attach to the running service:
+### Connect an agentic tool via URL
 
 ```json
 {
@@ -130,4 +114,8 @@ Clients that support HTTP transport can attach to the running service:
 }
 ```
 
-The stdio configuration shown above (command/args form) remains supported and unchanged; the URL form requires the service — or `node build/index.js --http` — to be running.
+Requires the service (or `node --expose-gc build/index.js --http`) to be running. The stdio configuration keeps working unchanged.
+
+## License
+
+MIT

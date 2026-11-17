@@ -10,7 +10,6 @@ MCP server exposing Ollama's `web_search` and `web_fetch` APIs as tools. Two mod
 Build outputs: `build/index.js` = cold wrapper + stdio launcher (contains no MCP tool code); `build/server.js` = the real code (tree-shaken MCP stack, lazy-loaded per request into a worker isolate, dropped after idle via `worker.terminate()` + `global.gc()`).
 
 - `src/index.ts` → wrapper/launcher · `src/server.ts` = real code AND worker entry (`!isMainThread`)
-- `web-search-mcp.py` — legacy Python reference only. It deliberately lacks error handling, timeouts, and truncation (see `plan.md`); do not treat its patterns as desired behavior.
 
 ## Commands
 
@@ -69,8 +68,3 @@ curl -s -X POST http://127.0.0.1:33011/mcp -H 'Content-Type: application/json' -
 - Tool results are raw `JSON.stringify` of the API response — structured JSON, not formatted prose. Keep it that way.
 - HTTP mode binds `127.0.0.1` only and is stateless (one transport per request) — no session ids, no GET SSE stream (405). That is deliberate: restart-safe with zero server-side state.
 
-## References
-
-- `plan.md` — design doc: rationale for every invariant above, risk registry, API response shapes.
-- `.agents/skills/building-mcp-nodejs/` — MCP SDK patterns this code follows (`registerTool` 3-arg API, transport setup incl. Streamable HTTP).
-- `.agents/skills/ollama-web-search/` — Ollama API reference (endpoints, request/response shapes, limits).
