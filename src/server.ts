@@ -111,9 +111,9 @@ const WebSearchResponseSchema = z.object({
 });
 
 const WebFetchResponseSchema = z.object({
-  title: z.string(),
-  content: z.string(),
-  links: z.array(z.string()),
+  title: z.string().nullish().transform((v) => v ?? ""),
+  content: z.string().nullish().transform((v) => v ?? ""),
+  links: z.array(z.string()).nullish().transform((v) => v ?? []),
 });
 
 // ---------------------------------------------------------------------------
