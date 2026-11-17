@@ -1,16 +1,24 @@
 {
   "name": "ollama-web-search-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server exposing Ollama web_search and web_fetch as tools",
   "type": "module",
+  "license": "MIT",
   "main": "build/index.js",
   "bin": {
     "ollama-web-search-mcp": "build/index.js"
   },
+  "files": [
+    "build"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc && chmod 755 build/index.js",
     "dev": "node --import tsx src/index.ts",
-    "start": "node build/index.js"
+    "start": "node build/index.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
