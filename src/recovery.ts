@@ -61,6 +61,11 @@ function withRequestId(message: string, requestId: string | undefined): string {
   return requestId ? `${message} (request-id: ${requestId})` : message;
 }
 
+function bodySnip(bodyText: string): string {
+  const snip = bodyText.replace(/\s+/g, " ").slice(0, 160);
+  return snip === "" ? "<empty>" : `<${snip}>`;
+}
+
 export function classify(
   endpoint: OllamaEndpoint,
   status: number,
@@ -81,30 +86,17 @@ export function classify(
       };
     }
 
-    const declaredType = contentTypeHeader?.toLowerCase() ?? "";
-    if (declaredType !== "" && !declaredType.includes("json")) {
-      return {
-        kind: "bad_success_body",
-        retryable: true,
-        maxRetries: 1,
-        resolution: withRequestId(
-          "Ollama API returned 200 with a non-JSON body (possible usage limit — check /api/usage). Retried once; the failure persisted.",
-          requestId
-        ),
-        requestId,
-      };
-    }
-
     try {
       const data: unknown = JSON.parse(bodyText);
       return { kind: "ok", retryable: false, resolution: "", data, requestId };
     } catch {
+      const declaredType = contentTypeHeader?.toLowerCase() ?? "none";
       return {
         kind: "bad_success_body",
         retryable: true,
         maxRetries: 1,
         resolution: withRequestId(
-          "Ollama API returned 200 with an unparseable body (possible usage limit — check /api/usage). Retried once; the failure persisted.",
+          `Ollama API returned 200 with an unparseable body ${bodySnip(bodyText)} (declared content-type: ${declaredType}; possible usage limit — check /api/usage). Retried once; the failure persisted.`,
           requestId
         ),
         requestId,

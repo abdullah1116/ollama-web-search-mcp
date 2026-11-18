@@ -67,5 +67,6 @@ curl -s -X POST http://127.0.0.1:33011/mcp -H 'Content-Type: application/json' -
 - `max_results` defaults to 3 on purpose (API default is 5) — deliberate, don't "fix" it.
 - Tool results are raw `JSON.stringify` of the API response — structured JSON, not formatted prose. Keep it that way.
 - `OLLAMA_API_BASE` overrides the API root (default `https://ollama.com/api`) — the error-mock test suite depends on it. `web_fetch` `{"error":"not found"}` means the target was blocked upstream, NOT that the URL is invalid (ollama#18143).
+- Build with the service STOPPED (`systemctl --user stop` → build → `start`): the wrapper re-imports `build/server.js` from disk after idle eviction, and rebuilding under a live service has dropped this session's MCP registration (tool catalog loses `ollama-web-search` until `/reload`).
 - HTTP mode binds `127.0.0.1` only and is stateless (one transport per request) — no session ids, no GET SSE stream (405). That is deliberate: restart-safe with zero server-side state.
 
