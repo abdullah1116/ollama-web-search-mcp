@@ -50,7 +50,7 @@ curl -s -X POST http://127.0.0.1:33011/mcp -H 'Content-Type: application/json' -
 
 - **Import fence**: `src/index.ts` must never import `./server.js` statically or via a literal `import("./server.js")` — only the derived-specifier `await import(...)` / `new Worker(path)` form. Mechanism: a literal specifier lets esbuild inline the MCP stack into the wrapper bundle, which kills lazy-load. Gate: `grep -c registerTool build/index.js` must be 0.
 - **stdout is JSON-RPC only** (stdio mode). Never `console.log`; all logging via `console.error`. One stray `console.log` corrupts the protocol stream.
-- Every Ollama API call goes through `ollamaFetch` — timeout (30s `AbortController`), auth header, structured errors. No direct `fetch()` calls.
+- Every Ollama API call goes through `ollamaFetch` — a retry loop over `classify()` in `src/recovery.ts`: 55s total deadline, per-attempt timeouts 15s/30s, `Retry-After` honored (delay-seconds or HTTP-date), full-jitter backoff. No direct `fetch()` calls. **A 200 with an empty body is quota exhaustion, not success** — that check must stay before any JSON parse (upstream ships it this way: ollama/ollama#16045).
 - Validate Ollama response shapes with Zod `safeParse`; blind `as` casts are forbidden. Shape drift must fail with "Unexpected response shape from Ollama API", not a cryptic `undefined` access.
 - Never put `OLLAMA_API_KEY` value in logs or error messages.
 - `web_fetch` content is truncated at 50k chars (`MAX_FETCH_CONTENT_LENGTH`) to protect LLM context — keep truncation and its notice.
@@ -66,5 +66,6 @@ curl -s -X POST http://127.0.0.1:33011/mcp -H 'Content-Type: application/json' -
 - ESM + `module: Node16`: relative imports need `.js` extensions (tsx maps `.js` → `.ts` in dev). Node 18+ required (native `fetch`).
 - `max_results` defaults to 3 on purpose (API default is 5) — deliberate, don't "fix" it.
 - Tool results are raw `JSON.stringify` of the API response — structured JSON, not formatted prose. Keep it that way.
+- `OLLAMA_API_BASE` overrides the API root (default `https://ollama.com/api`) — the error-mock test suite depends on it. `web_fetch` `{"error":"not found"}` means the target was blocked upstream, NOT that the URL is invalid (ollama#18143).
 - HTTP mode binds `127.0.0.1` only and is stateless (one transport per request) — no session ids, no GET SSE stream (405). That is deliberate: restart-safe with zero server-side state.
 

@@ -2,16 +2,30 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { isMainThread, parentPort } from "node:worker_threads";
 import { z } from "zod";
+import {
+  classify,
+  retryDelayMs,
+  type Classification,
+  type OllamaEndpoint,
+} from "./recovery.js";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const OLLAMA_API_BASE = "https://ollama.com/api";
-const REQUEST_TIMEOUT_MS = 30_000;
+const OLLAMA_API_BASE = (
+  process.env.OLLAMA_API_BASE ?? "https://ollama.com/api"
+).replace(/\/+$/, "");
 const MAX_FETCH_CONTENT_LENGTH = 50_000;
+const TOTAL_DEADLINE_MS = 55_000;
+const MAX_ATTEMPTS = 5;
+const MIN_ATTEMPT_WINDOW_MS = 1_000;
+const ENDPOINT_BUDGET_MS: Record<OllamaEndpoint, number> = {
+  "/web_search": 15_000,
+  "/web_fetch": 30_000,
+};
 const SERVER_NAME = "ollama-web-search";
-const SERVER_VERSION = "1.1.0";
+const SERVER_VERSION = "1.2.0";
 
 // ---------------------------------------------------------------------------
 // Bridge protocol (wrapper ⇄ worker)
@@ -45,55 +59,136 @@ function getApiKey(): string {
 }
 
 async function ollamaFetch(
-  endpoint: string,
+  endpoint: OllamaEndpoint,
   body: Record<string, unknown>
 ): Promise<unknown> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  return enqueueOllamaCall(() => ollamaFetchWithRetry(endpoint, body));
+}
 
-  try {
-    const response = await fetch(`${OLLAMA_API_BASE}${endpoint}`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${getApiKey()}`,
-      },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
+let ollamaQueue: Promise<unknown> = Promise.resolve();
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => "");
-      if (response.status === 401) {
-        throw new Error("Unauthorized: OLLAMA_API_KEY is invalid or expired");
-      }
-      if (response.status === 429) {
-        throw new Error("Rate limited: too many requests to Ollama API");
-      }
-      throw new Error(
-        `Ollama API error: HTTP ${response.status} ${response.statusText}${text ? ` — ${text.slice(0, 200)}` : ""}`
-      );
-    }
+function enqueueOllamaCall<T>(task: () => Promise<T>): Promise<T> {
+  const run = ollamaQueue.then(task, task);
+  ollamaQueue = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
-    let data: unknown;
-    try {
-      data = await response.json();
-    } catch {
-      throw new Error(
-        "Ollama API returned a non-JSON response. The API may be experiencing issues."
-      );
-    }
-    return data;
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
-      throw new Error(
-        `Request to Ollama API timed out after ${REQUEST_TIMEOUT_MS / 1000}s`
-      );
-    }
-    throw error;
-  } finally {
-    clearTimeout(timeout);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function timeoutReason(error: unknown, timeoutMs: number): string {
+  if (error instanceof Error) {
+    return error.name === "AbortError"
+      ? `timeout after ${timeoutMs}ms`
+      : error.message;
   }
+  return String(error);
+}
+
+async function ollamaFetchWithRetry(
+  endpoint: OllamaEndpoint,
+  body: Record<string, unknown>
+): Promise<unknown> {
+  const deadline = Date.now() + TOTAL_DEADLINE_MS;
+  const budget = ENDPOINT_BUDGET_MS[endpoint];
+  const targetUrl = typeof body.url === "string" ? body.url : undefined;
+  const retriesByKind = new Map<string, number>();
+  let last: Classification | null = null;
+  let attempts = 0;
+
+  while (attempts < MAX_ATTEMPTS) {
+    const remaining = deadline - Date.now();
+    if (remaining < MIN_ATTEMPT_WINDOW_MS) {
+      break;
+    }
+    attempts += 1;
+
+    const controller = new AbortController();
+    const attemptTimeout = Math.min(budget, remaining);
+    const timer = setTimeout(() => controller.abort(), attemptTimeout);
+
+    let outcome: Classification;
+    let retryAfter: string | null = null;
+
+    try {
+      const response = await fetch(`${OLLAMA_API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${getApiKey()}`,
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const bodyText = await response.text();
+      retryAfter = response.headers.get("retry-after");
+      outcome = classify(
+        endpoint,
+        response.status,
+        response.headers.get("content-type"),
+        response.headers.get("content-length"),
+        bodyText,
+        {
+          requestId: response.headers.get("x-request-id") ?? undefined,
+          targetUrl,
+        }
+      );
+    } catch (error) {
+      // status 0 = no HTTP response reached us (network fault or timeout)
+      outcome = classify(
+        endpoint,
+        0,
+        null,
+        null,
+        timeoutReason(error, attemptTimeout),
+        { targetUrl }
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (outcome.kind === "ok") {
+      return outcome.data;
+    }
+
+    last = outcome;
+
+    if (!outcome.retryable) {
+      break;
+    }
+
+    const used = retriesByKind.get(outcome.kind) ?? 0;
+    const maxRetries = outcome.maxRetries ?? Number.POSITIVE_INFINITY;
+    if (used >= maxRetries) {
+      break;
+    }
+
+    const budgetLeft = deadline - Date.now();
+    if (budgetLeft < MIN_ATTEMPT_WINDOW_MS) {
+      break;
+    }
+
+    const wait = Math.min(retryDelayMs(attempts - 1, retryAfter), budgetLeft);
+    retriesByKind.set(outcome.kind, used + 1);
+    console.error(
+      `ollamaFetch retry ${attempts}/${MAX_ATTEMPTS} in ${Math.round(wait)}ms (${outcome.kind})`
+    );
+    await sleep(wait);
+  }
+
+  const failure: Classification = last ?? {
+    kind: "transient",
+    retryable: false,
+    resolution: "Ollama API request could not be completed before the deadline.",
+  };
+  console.error(
+    `ollamaFetch failed after ${attempts} attempt(s): ${failure.kind}${failure.requestId ? ` (request-id: ${failure.requestId})` : ""}`
+  );
+  throw new Error(failure.resolution);
 }
 
 // ---------------------------------------------------------------------------

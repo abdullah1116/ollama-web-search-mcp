@@ -32,6 +32,9 @@ An [Ollama API key](https://ollama.com/settings/keys) is required — the server
 | `OLLAMA_API_KEY` | yes | — | Ollama API key |
 | `MCP_PORT` | no | `33011` | HTTP mode: listen port (loopback only) |
 | `MCP_IDLE_MS` | no | `60000` | HTTP mode: idle ms before the loaded code is evicted and memory returns to the cold floor |
+| `OLLAMA_API_BASE` | no | `https://ollama.com/api` | Ollama API root override (proxy or test mock) |
+
+Transient failures (429, 5xx, timeouts, network drops) retry automatically with `Retry-After` honored and jittered backoff; auth, quota, and blocked-target errors fail immediately with a message that says how to fix them.
 
 ## stdio mode
 
