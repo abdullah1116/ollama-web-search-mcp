@@ -28,7 +28,7 @@
     "build": "tsc --noEmit && esbuild src/index.ts src/server.ts --bundle --format=esm --platform=node --target=node18 --outdir=build --tree-shaking=true && chmod 755 build/index.js",
     "dev": "node --import tsx src/index.ts",
     "start": "node build/index.js",
-    "prepublishOnly": "npm run build"
+    "prepare": "npm run build"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
